@@ -1,0 +1,7 @@
+streamlit
+torch
+transformers
+accelerate
+sentencepiece
+pypdf
+python-docx
