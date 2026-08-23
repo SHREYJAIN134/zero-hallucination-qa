@@ -1,7 +1,10 @@
-streamlit
 torch
+torchvision
+torchaudio
 transformers
 accelerate
-sentencepiece
+streamlit
 pypdf
 python-docx
+sentence-transformers
+faiss-cpu
