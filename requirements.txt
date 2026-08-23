@@ -1,10 +1,6 @@
-﻿torch
-torchvision
-torchaudio
-transformers
-accelerate
-streamlit
+﻿streamlit
 pypdf
 python-docx
 sentence-transformers
 faiss-cpu
+huggingface_hub

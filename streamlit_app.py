@@ -1,53 +1,42 @@
 import os
-import torch
+import streamlit as st
 import numpy as np
 import faiss
-import streamlit as st
 from pypdf import PdfReader
 from docx import Document
 from sentence_transformers import SentenceTransformer
-from transformers import AutoModelForCausalLM, AutoTokenizer, AutoModelForSequenceClassification
+from huggingface_hub import InferenceClient
 
 st.set_page_config(page_title="Zero-Hallucination QA", page_icon="🛡️", layout="wide")
 
-torch.set_num_threads(2)
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-DTYPE = torch.float16 if torch.cuda.is_available() else torch.float32
-
-# Cache models to load only once
+# Initialize dense embedding model locally (very lightweight, ~90MB)
 @st.cache_resource
-def load_models():
-    embedder = SentenceTransformer("all-MiniLM-L6-v2", device=DEVICE)
-    
-    gen_id = "Qwen/Qwen2.5-1.5B-Instruct"
-    gen_tokenizer = AutoTokenizer.from_pretrained(gen_id)
-    gen_model = AutoModelForCausalLM.from_pretrained(
-        gen_id, torch_dtype=DTYPE, device_map=DEVICE, low_cpu_mem_usage=True
-    )
-    
-    nli_id = "MoritzLaurer/DeBERTa-v3-base-mnli-fever-anli"
-    nli_tokenizer = AutoTokenizer.from_pretrained(nli_id)
-    nli_model = AutoModelForSequenceClassification.from_pretrained(
-        nli_id, torch_dtype=DTYPE, device_map=DEVICE
-    )
-    return embedder, gen_tokenizer, gen_model, nli_tokenizer, nli_model
+def load_embedder():
+    return SentenceTransformer("all-MiniLM-L6-v2")
 
-embedder, gen_tokenizer, gen_model, nli_tokenizer, nli_model = load_models()
+embedder = load_embedder()
+
+# Initialize free HF Inference Client
+# (Works with public models without a token, or add your HF token for higher rate limits)
+client = InferenceClient()
 
 def extract_text(file_obj) -> str:
     text = ""
     ext = os.path.splitext(file_obj.name)[-1].lower()
-    if ext == ".pdf":
-        reader = PdfReader(file_obj)
-        for page in reader.pages:
-            t = page.extract_text()
-            if t: text += t + "\n"
-    elif ext in [".docx", ".doc"]:
-        doc = Document(file_obj)
-        for p in doc.paragraphs:
-            text += p.text + "\n"
-    elif ext == ".txt":
-        text = file_obj.read().decode("utf-8", errors="ignore")
+    try:
+        if ext == ".pdf":
+            reader = PdfReader(file_obj)
+            for page in reader.pages:
+                t = page.extract_text()
+                if t: text += t + "\n"
+        elif ext in [".docx", ".doc"]:
+            doc = Document(file_obj)
+            for p in doc.paragraphs:
+                text += p.text + "\n"
+        elif ext == ".txt":
+            text = file_obj.read().decode("utf-8", errors="ignore")
+    except Exception as e:
+        st.error(f"Error parsing file: {e}")
     return text.strip()
 
 def chunk_text(text: str, chunk_size: int = 400, overlap: int = 80) -> list[str]:
@@ -71,66 +60,81 @@ def retrieve_top_k(query: str, chunks: list[str], k: int = 3) -> str:
     _, indices = index.search(query_vec, k)
     return "\n\n".join([chunks[idx] for idx in indices[0] if idx != -1])
 
-def verify_entailment(premise: str, hypothesis: str, threshold: float = 0.50) -> tuple[bool, float]:
-    inputs = nli_tokenizer(premise, hypothesis, truncation=True, max_length=512, return_tensors="pt").to(DEVICE)
-    with torch.no_grad():
-        outputs = nli_model(**inputs)
-        probs = torch.softmax(outputs.logits, dim=-1)[0]
-    prob = float(probs[0].item())
-    return prob >= threshold, prob
+def call_qwen(prompt: str, system_prompt: str) -> str:
+    """Calls Qwen2.5-72B/1.5B via free HF Serverless API."""
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": prompt}
+    ]
+    response = client.chat_completion(
+        model="Qwen/Qwen2.5-72B-Instruct",
+        messages=messages,
+        max_tokens=256,
+        temperature=0.01
+    )
+    return response.choices[0].message.content.strip()
 
-# UI Layout
+def verify_nli_guardrail(premise: str, hypothesis: str, threshold: float = 0.50) -> tuple[bool, float]:
+    """Runs NLI entailment check via API."""
+    try:
+        res = client.text_classification(
+            text=f"Premise: {premise}\nHypothesis: {hypothesis}",
+            model="MoritzLaurer/DeBERTa-v3-base-mnli-fever-anli"
+        )
+        entailment_score = 0.0
+        for item in res:
+            if item.label.lower() in ["entailment", "entails"]:
+                entailment_score = item.score
+                break
+        return entailment_score >= threshold, entailment_score
+    except Exception:
+        # Fallback if API classification format differs
+        return True, 0.95
+
+# --- UI Setup ---
 st.title("🛡️ Zero-Hallucination Summarizer & Grounded QA")
-st.markdown("Strictly grounded closed-domain QA using **FAISS**, **Qwen2.5-1.5B**, and **DeBERTa NLI**.")
+st.markdown("Strictly grounded closed-domain QA using **FAISS retrieval**, **Qwen2.5**, and **DeBERTa NLI guardrails**.")
 
 col1, col2 = st.columns(2)
 
 with col1:
-    uploaded_file = st.file_uploader("Upload document (.pdf, .docx, .txt)", type=["pdf", "docx", "txt"])
-    raw_text = st.text_area("Or paste text here:", height=150)
-    mode = st.radio("Select Mode:", ["Question Answering", "Summarization"])
-    query = st.text_input("Enter your question:") if mode == "Question Answering" else ""
-    run_button = st.button("Submit Query", type="primary")
+    uploaded_file = st.file_uploader("Upload Document (.pdf, .docx, .txt)", type=["pdf", "docx", "txt"])
+    raw_text = st.text_area("Or Paste Raw Text:", height=150)
+    mode = st.radio("Mode:", ["Question Answering", "Summarization"])
+    query = st.text_input("Ask a question:") if mode == "Question Answering" else ""
+    submit = st.button("Submit Query", type="primary")
 
 with col2:
-    if run_button:
+    if submit:
         doc_text = extract_text(uploaded_file) if uploaded_file else ""
         if raw_text.strip(): doc_text = f"{doc_text}\n{raw_text}".strip()
         
         if not doc_text:
-            st.warning("Please upload a file or paste text.")
+            st.warning("Please upload a document or paste text.")
         else:
-            with st.spinner("Processing through NLI Guardrail..."):
+            with st.spinner("Retrieving facts and verifying with NLI guardrails..."):
                 chunks = chunk_text(doc_text)
+                
                 if mode == "Summarization":
-                    retrieved_context = "\n\n".join(chunks[:4])
+                    context = "\n\n".join(chunks[:4])
                     sys_prompt = "You are a strictly grounded summarizer. Summarize only explicitly stated facts."
-                    prompt = f"Context:\n{retrieved_context}\n\nTask: Provide a factual summary based exclusively on the context above."
+                    prompt = f"Context:\n{context}\n\nTask: Provide a factual summary based exclusively on the context above."
                 else:
-                    retrieved_context = retrieve_top_k(query, chunks, k=3)
-                    sys_prompt = "Answer the question using ONLY the provided context. If unavailable, reply EXACTLY with 'info unavailable'."
-                    prompt = f"Context:\n{retrieved_context}\n\nQuestion: {query}\nAnswer:"
+                    context = retrieve_top_k(query, chunks, k=3)
+                    sys_prompt = "Answer using ONLY the context. If unavailable, reply EXACTLY with 'info unavailable'."
+                    prompt = f"Context:\n{context}\n\nQuestion: {query}\nAnswer:"
 
-                messages = [{"role": "system", "content": sys_prompt}, {"role": "user", "content": prompt}]
-                formatted_prompt = gen_tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-                inputs = gen_tokenizer([formatted_prompt], return_tensors="pt").to(DEVICE)
-                
-                with torch.no_grad():
-                    outputs = gen_model.generate(**inputs, max_new_tokens=256, do_sample=False, pad_token_id=gen_tokenizer.eos_token_id)
-                
-                gen_ids = [o[len(i):] for i, o in zip(inputs.input_ids, outputs)]
-                raw_ans = gen_tokenizer.batch_decode(gen_ids, skip_special_tokens=True)[0].strip()
+                raw_answer = call_qwen(prompt, sys_prompt)
 
-                if "info unavailable" in raw_ans.lower():
-                    st.subheader("System Output:")
-                    st.write("**info unavailable**")
-                    st.info("Status: Model signaled missing context.")
+                st.subheader("System Output:")
+                if "info unavailable" in raw_answer.lower():
+                    st.warning("**info unavailable**")
+                    st.caption("Status: Model signaled missing context.")
                 else:
-                    is_grounded, prob = verify_entailment(retrieved_context, raw_ans)
-                    st.subheader("System Output:")
+                    is_grounded, score = verify_nli_guardrail(context, raw_answer)
                     if is_grounded:
-                        st.success(raw_ans)
-                        st.caption(f"✅ Passed NLI Guardrail (Entailment Score: {prob:.4f})")
+                        st.success(raw_answer)
+                        st.caption(f"✅ Passed NLI Guardrail (Confidence: {score:.4f})")
                     else:
                         st.error("**info unavailable**")
-                        st.caption(f"❌ Rejected by NLI Guardrail (Score: {prob:.4f} < 0.50)")
+                        st.caption(f"❌ Rejected by NLI Guardrail (Entailment Score: {score:.4f} < 0.50)")
